@@ -3,12 +3,15 @@
 const HERO_NAME = 'Spider-River';   // hero name shown on the title screen
 const KID_NAME  = 'River';          // used in "You saved the city, River!"
 // ==================================
-const VERSION = '3';
+const VERSION = '4';
 const RESCUE_GOAL = 6;        // people to save across the city
 const LEVEL_LEN = 12000;      // city length in pixels (finish line)
 const GRAV = 1220, RUN = 152, FEET = 40, R = 26, MAXV = 620;
 const JUMP_V = 560, DJUMP_V = 600, SWING_JUMP_V = 640, JUMP_VX = 225;
-const COYOTE = 0.14, JUMP_BUFFER = 0.12, CAM_X = 92; // camera keeps River ~23% from the left
+const COYOTE = 0.14, JUMP_BUFFER = 0.12, CAM_X = 92;
+// v4 manual movement (◀ ▶): snappy start, crisp stop, steerable in the air
+const RUN_R = 170, RUN_L = 160, ACC_G = 1500, DEC_G = 2400, AIR_MAX = 230, AIR_ACC = 1000, LOOK = 70, MIN_X = 40;
+const approach = (v, t, d) => v < t ? Math.min(t, v + d) : Math.max(t, v - d);
 const HS_KEY = 'spider-river-best', MUTE_KEY = 'spider-river-mute';
 
 const cv = document.getElementById('c'), ctx = cv.getContext('2d');
@@ -56,6 +59,19 @@ function loadWard() {
   if (!out.unlocked.includes(out.acc)) out.acc = 'none';
   return out;
 }
+const RESET_KEY = 'spider-river-reset-v4';
+const freshWard = () => ({ tokens: 0, pages: 0, unlocked: ['none'], mask: 'up', acc: 'none' });
+(function freshStartOnce() { // wipes old v1–v3 test progress the first time v4 opens; ?reset=1 wipes again
+  try {
+    const qs = new URLSearchParams(location.search), urlReset = qs.get('reset') === '1';
+    if (localStorage.getItem(RESET_KEY) !== '1' || urlReset) {
+      localStorage.removeItem(HS_KEY);
+      localStorage.setItem(WARD_KEY, JSON.stringify(freshWard()));
+      localStorage.setItem(RESET_KEY, '1');
+    }
+    if (urlReset) { qs.delete('reset'); const q = qs.toString(); history.replaceState(null, '', location.pathname + (q ? '?' + q : '') + location.hash); }
+  } catch (e) { }
+})();
 let ward = loadWard();
 function saveWard() { try { localStorage.setItem(WARD_KEY, JSON.stringify(ward)); } catch (e) { } }
 const accById = id => ACCS.find(a => a.id === id);
@@ -276,16 +292,18 @@ let state = 'title', P, camX = 0, T = 0, stats, best = +localStorage.getItem(HS_
 let FX = [], TXT = [], SH = [], hintT = 0, endT = 0, suitAcc = 'none', bankMsg = null;
 const input = { jumpQ: 0, jumpHeld: false, zapQ: false, block: false };
 const ptrs = new Map(); // pointerId -> role ('swing' | 'jump' | 'zap' | 'ui')
-let keySwing = false;
+let keySwing = false, keyL = false, keyR = false, suitModal = false;
 const swingHeld = () => keySwing || [...ptrs.values()].includes('swing');
+function moveDir() { let d = 0; for (const r of ptrs.values()) { if (r === 'left') d -= 1; else if (r === 'right') d += 1; } if (keyL) d -= 1; if (keyR) d += 1; return Math.sign(d); }
+const swingDir = () => moveDir() || (P ? P.face : 1);
 const jumpHeldNow = () => input.jumpHeld || [...ptrs.values()].includes('jump');
 function newGame() {
   genLevel();
   const b0 = B[0];
-  P = { x: 140, y: b0.y - FEET, vx: RUN, vy: 0, st: 'run', A: null, L: 0, inv: 0, webCD: 0, zapCD: 0, punch: 0, hearts: 3, face: 1, lastB: b0,
+  P = { x: 140, y: b0.y - FEET, vx: 0, vy: 0, st: 'run', sdir: 1, look: LOOK, climbSide: -1, A: null, L: 0, inv: 0, webCD: 0, zapCD: 0, punch: 0, hearts: 3, face: 1, lastB: b0,
         coyote: 0, canDouble: true, flip: 0, flipT: 0, jumpHoldT: 9, jumping: false, maxRise: 0, onRoof: true, trail: [] };
   preloadCombo(curKey());
-  camX = P.x - CAM_X; stats = { score: 0, tokens: 0, saved: 0, beaten: 0, pages: 0, jumps: 0, doubles: 0, swings: 0 }; FX = []; TXT = []; SH = []; hintT = 6; newBest = false;
+  camX = Math.max(0, P.x - W / 2 + LOOK); stats = { score: 0, tokens: 0, saved: 0, beaten: 0, pages: 0, jumps: 0, doubles: 0, swings: 0 }; FX = []; TXT = []; SH = []; hintT = 5; newBest = false;
   state = 'play'; input.block = true; input.zapQ = false; input.jumpQ = 0;
 }
 const score = n => { stats.score += n; };
@@ -296,38 +314,39 @@ function puff(x, y) { for (let i = 0; i < 14; i++) { const a = Math.PI * (0.15 +
 
 function roofAt(x) { for (const b of B) if (x >= b.x && x <= b.x + b.w) return b; return null; }
 // best visible anchor in range ahead of River
-function pickAnchor() {
+function pickAnchor(dir) {
+  dir = dir || swingDir();
   let best = null, bs = 1e9;
   for (const a of ANCH) {
-    const dx = a.x - P.x, dy = P.y - a.y;
+    const dx = (a.x - P.x) * dir, dy = P.y - a.y;
     if (dx < 30 || dx > 340 || dy < 70) continue;
     const s = Math.abs(dx - 165) + Math.abs(dy - 250) * 0.4; if (s < bs) { bs = s; best = a; }
   }
-  if (!best) for (const a of ANCH) { const dx = a.x - P.x, d = Math.hypot(dx, P.y - a.y); if (dx > -10 && a.y < P.y - 20 && d < 460 && d < bs) { bs = d; best = a; } }
+  if (!best) for (const a of ANCH) { const dx = (a.x - P.x) * dir, d = Math.hypot(dx, P.y - a.y); if (dx > -10 && a.y < P.y - 20 && d < 460 && d < bs) { bs = d; best = a; } }
   return best;
 }
 function attach() {
-  const a = pickAnchor(); if (!a) { P.webCD = 0.1; return; }
-  P.A = a; P.L = Math.hypot(a.x - P.x, a.y - P.y); P.st = 'swing'; P.canDouble = true; P.flip = 0; P.jumping = false;
-  if (P.vx < 170) P.vx = 170; if (P.vy > 260) P.vy = 260; if (P.onRoof) { P.vy = -300; }
+  const dir = swingDir(), a = pickAnchor(dir); if (!a) { P.webCD = 0.1; return; }
+  P.A = a; P.L = Math.hypot(a.x - P.x, a.y - P.y); P.st = 'swing'; P.canDouble = true; P.flip = 0; P.jumping = false; P.sdir = dir; P.face = dir;
+  if (P.vx * dir < 170) P.vx = 170 * dir; if (P.vy > 260) P.vy = 260; if (P.onRoof) { P.vy = -300; }
   stats.swings++; SFX.thwip(); FX.push({ web: true, x: a.x, y: a.y, t: 0, life: 0.4 });
-  if (T - (P.thwipT || -9) > 3 && Math.random() < 0.5) { P.thwipT = T; pop('THWIP!', P.x + (a.x - P.x) * 0.6 + 34, P.y + (a.y - P.y) * 0.62, '#ffffff'); }
+  if (T - (P.thwipT || -9) > 3 && Math.random() < 0.5) { P.thwipT = T; pop('THWIP!', P.x + (a.x - P.x) * 0.6 + 34 * dir, P.y + (a.y - P.y) * 0.62, '#ffffff'); }
 }
 function release(boost) {
   if (!P.A) return; P.A = null; P.st = 'air'; P.canDouble = true;
-  if (boost) { P.vx += 40; P.vy -= 120; }
+  if (boost) { P.vx += 40 * P.sdir; P.vy -= 120; }
   P.webCD = 0.12;
 }
 function doJump(kind) {
   input.jumpQ = 0; P.jumpHoldT = 0; P.jumping = true; P.coyote = 0;
-  if (kind === 'ground') { P.vy = -JUMP_V; P.vx = Math.max(P.vx, JUMP_VX); P.st = 'air'; stats.jumps++; SFX.jump(); P.canDouble = true; P.flip = 0; }
-  else if (kind === 'swing') { P.A = null; P.vy = Math.min(P.vy, 0) - SWING_JUMP_V * 0.85; P.vy = Math.max(P.vy, -SWING_JUMP_V - 80); P.vx = Math.max(P.vx, 220); P.st = 'air'; P.canDouble = true; P.webCD = 0.25; stats.jumps++; SFX.djump(); P.flip = 1; P.flipT = 0; puff(P.x, P.y + 20); }
-  else { P.vy = -DJUMP_V; P.vx = Math.max(P.vx, 200); P.canDouble = false; stats.doubles++; SFX.djump(); P.flip = 1; P.flipT = 0; puff(P.x, P.y + 30); if (ward.acc === 'backpack') starBurst(P.x, P.y); if (Math.random() < 0.35) pop('FLIP!', P.x, P.y - 60, '#ffffff'); }
+  if (kind === 'ground') { P.vy = -JUMP_V; { const d = moveDir(); if (d) P.vx = d * Math.max(P.vx * d, 190); } P.st = 'air'; stats.jumps++; SFX.jump(); P.canDouble = true; P.flip = 0; }
+  else if (kind === 'swing') { P.A = null; P.vy = Math.min(P.vy, 0) - SWING_JUMP_V * 0.85; P.vy = Math.max(P.vy, -SWING_JUMP_V - 80); { const d = moveDir() || P.sdir; P.vx = d * Math.max(P.vx * d, 220); } P.st = 'air'; P.canDouble = true; P.webCD = 0.25; stats.jumps++; SFX.djump(); P.flip = 1; P.flipT = 0; puff(P.x, P.y + 20); }
+  else { P.vy = -DJUMP_V; { const d = moveDir(); if (d) P.vx = d * Math.max(P.vx * d, 200); } P.canDouble = false; stats.doubles++; SFX.djump(); P.flip = 1; P.flipT = 0; puff(P.x, P.y + 30); if (ward.acc === 'backpack') starBurst(P.x, P.y); if (Math.random() < 0.35) pop('FLIP!', P.x, P.y - 60, '#ffffff'); }
 }
 function hurt() {
   if (P.inv > 0) return;
   P.hearts--; P.inv = 2; SFX.hurt(); pop('OOF!', P.x, P.y - 50, '#ff8a3b', true);
-  P.A = null; P.st = 'air'; P.vx = -140; P.vy = -380; P.flip = 0;
+  P.A = null; P.st = 'air'; P.vx = -140 * P.face; P.vy = -380; P.flip = 0;
   if (P.hearts <= 0) endGame(false);
 }
 function defeat(e, how) {
@@ -340,18 +359,18 @@ function zap() {
   let best = null, bd = 1e9;
   for (const e of EN) if (e.alive) {
     const dx = e.x - P.x, dy = (e.y - (e.type === 'drone' ? 0 : 34)) - P.y;
-    if (dx > -80 && dx < 420 && Math.abs(dy) < 380) { const d = Math.hypot(dx, dy); if (d < bd) { bd = d; best = e; } }
+    const fx = dx * P.face; if (fx > -80 && fx < 420 && Math.abs(dy) < 380) { const d = Math.hypot(dx, dy); if (d < bd) { bd = d; best = e; } }
   }
   P.punch = 0.3;
   if (best && bd < 75) { defeat(best, 'POW!'); return; }
   SFX.zap();
-  const tx = best ? best.x : P.x + 400, ty = best ? best.y - (best.type === 'drone' ? 0 : 34) : P.y - 10;
+  const tx = best ? best.x : P.x + 400 * P.face, ty = best ? best.y - (best.type === 'drone' ? 0 : 34) : P.y - 10;
   const d = Math.hypot(tx - P.x, ty - P.y) || 1;
-  SH.push({ x: P.x + 34, y: P.y - 14, vx: (tx - P.x) / d * 900 + P.vx * 0.5, vy: (ty - P.y) / d * 900, t: 0 });
+  SH.push({ x: P.x + 34 * P.face, y: P.y - 14, vx: (tx - P.x) / d * 900 + P.vx * 0.5, vy: (ty - P.y) / d * 900, t: 0 });
 }
 function endGame(win) {
   if (state !== 'play') return;
-  state = win ? 'win' : 'over'; endT = 0; ptrs.clear(); keySwing = false;
+  state = win ? 'win' : 'over'; endT = 0; ptrs.clear(); keySwing = false; keyL = keyR = false;
   if (win) { SFX.win(); for (let i = 0; i < 80; i++) FX.push({ conf: true, x: Math.random() * W, y: -Math.random() * H * 0.5, vx: (Math.random() - .5) * 60, vy: 120 + Math.random() * 160, t: 0, life: 6, col: ['#ff2e5f', '#ffde3b', '#9b2cff', '#55e6ff', '#ffffff'][i % 5], rot: Math.random() * 6 }); }
   else SFX.over();
   ward.tokens += stats.tokens; ward.pages += stats.pages; saveWard();
@@ -360,9 +379,12 @@ function endGame(win) {
 }
 function land(b) {
   P.y = b.y - FEET; P.st = 'run'; P.A = null; P.vy = 0; P.lastB = b; P.canDouble = true; P.flip = 0; P.jumping = false; P.onRoof = true;
-  if (P.vx < RUN) P.vx = RUN;
 }
 
+function startClimb(b, side) { // side -1 = left wall of building, +1 = right wall
+  P.st = 'climb'; P.climbB = b; P.climbSide = side; P.A = null; P.canDouble = true; P.flip = 0; P.vx = 0;
+  P.x = side < 0 ? b.x - R * 0.6 : b.x + b.w + R * 0.6; P.face = -side;
+}
 function step(dt) {
   T += dt;
   if (state !== 'play') { for (const f of FX) { f.t += dt; f.x += f.vx * dt; f.y += f.vy * dt; if (f.rot !== undefined) f.rot += dt * 3; } FX = FX.filter(f => f.t < f.life); for (const t of TXT) t.t += dt; TXT = TXT.filter(t => t.t < 1.4); return; }
@@ -370,11 +392,13 @@ function step(dt) {
   if (P.flip) { P.flipT += dt; if (P.flipT > 0.45) P.flip = 0; }
   if (input.zapQ) { input.zapQ = false; zap(); }
   const hold = swingHeld() && !input.block;
+  const dirX = moveDir(); if (dirX && P.st !== 'climb') P.face = dirX;
+  if (dirX || P.st !== 'run') hintT = Math.min(hintT, 0.5); // hint fades as soon as River moves
   // jump (with buffer + coyote time)
   if (input.jumpQ > 0) {
     if (P.st === 'run' || P.coyote > 0) doJump('ground');
     else if (P.st === 'swing') doJump('swing');
-    else if (P.st === 'climb') { P.st = 'air'; P.vy = -JUMP_V; P.vx = 200; P.canDouble = true; input.jumpQ = 0; SFX.jump(); }
+    else if (P.st === 'climb') { P.st = 'air'; P.vy = -JUMP_V; P.vx = -P.climbSide * 120; P.canDouble = true; input.jumpQ = 0; SFX.jump(); }
     else if (P.canDouble) doJump('double');
   }
   if (hold && !P.A && P.webCD <= 0 && P.st !== 'climb') attach();
@@ -382,23 +406,31 @@ function step(dt) {
   const px = P.x, pfeet = P.y + FEET, wasRoof = P.onRoof;
   P.onRoof = false;
   if (P.st === 'run') {
-    P.vx += (RUN - P.vx) * Math.min(1, dt * 3); P.x += P.vx * dt;
+    const tgt = dirX > 0 ? RUN_R : dirX < 0 ? -RUN_L : 0;
+    const acc = (!tgt || (P.vx * tgt < 0)) ? DEC_G : ACC_G; // crisp stop & quick turn-around
+    P.vx = approach(P.vx, tgt, acc * dt); P.x += P.vx * dt;
+    if (P.x < MIN_X) { P.x = MIN_X; P.vx = 0; }
     const b = roofAt(P.x);
     if (!b) { P.st = 'air'; P.vy = 0; P.coyote = COYOTE; } // ran off the edge: coyote time to still jump
     else { P.y = b.y - FEET; P.vy = 0; P.onRoof = true; P.lastB = b; }
   } else if (P.st === 'climb') {
     P.vy = -480; P.vx = 0; P.y += P.vy * dt;
     const b = P.climbB;
-    if (P.y + FEET <= b.y) { land(b); P.x = b.x + 12; puff(P.x, b.y); }
+    if (P.y + FEET <= b.y) { land(b); P.x = P.climbSide < 0 ? b.x + 12 : b.x + b.w - 12; P.vx = 0; puff(P.x, b.y); }
   } else {
     let g = GRAV;
     if (P.jumping && jumpHeldNow() && P.vy < 0 && P.jumpHoldT < 0.24) g *= 0.5; // hold for a higher jump
     P.vy += g * dt; if (P.vy > 900) P.vy = 900;
     if (P.st === 'swing' && P.A) {
       const dx = P.x - P.A.x, dy = P.y - P.A.y, d = Math.hypot(dx, dy) || 1, tx = -dy / d, ty = dx / d;
-      const dir = tx > 0 ? 1 : -1; P.vx += tx * dir * 170 * dt; P.vy += ty * dir * 170 * dt;
+      if (dirX) P.sdir = dirX;
+      const dir = (tx > 0 ? 1 : -1) * P.sdir; P.vx += tx * dir * 170 * dt; P.vy += ty * dir * 170 * dt;
+    } else { // mid-air steering
+      if (dirX) { if (P.vx * dirX < AIR_MAX) P.vx = approach(P.vx, dirX * AIR_MAX, AIR_ACC * dt); }
+      else P.vx = approach(P.vx, 0, 140 * dt);
     }
     P.x += P.vx * dt; P.y += P.vy * dt;
+    if (P.x < MIN_X) { P.x = MIN_X; if (P.vx < 0) P.vx = 0; }
     if (P.st === 'swing' && P.A) {
       // reel in so the low point of the swing clears the rooftop below
       const rb = roofAt(P.A.x) || roofAt(P.x);
@@ -408,7 +440,7 @@ function step(dt) {
         const nx = dx / d, ny = dy / d; P.x = P.A.x + nx * P.L; P.y = P.A.y + ny * P.L;
         const vr = P.vx * nx + P.vy * ny; if (vr > 0) { P.vx -= vr * nx; P.vy -= vr * ny; }
       }
-      if (P.x > P.A.x + P.L * 0.45 && P.vy < 0) { release(true); P.webCD = 0.08; } // chain to the next anchor
+      if ((P.x - P.A.x) * P.sdir > P.L * 0.45 && P.vy < 0) { release(true); P.webCD = 0.08; } // chain to the next anchor (either way)
     }
     const sp = Math.hypot(P.vx, P.vy); if (sp > MAXV) { P.vx *= MAXV / sp; P.vy *= MAXV / sp; }
     if (P.y < 30) { P.y = 30; if (P.vy < 0) P.vy = 0; }
@@ -417,20 +449,25 @@ function step(dt) {
       if (P.x + R * 0.6 > b.x && P.x - R * 0.6 < b.x + b.w) {
         const feet = P.y + FEET;
         if (feet >= b.y && pfeet <= b.y + 8 && P.vy >= 0) { const hard = P.vy > 420; land(b); if (hard) burst(P.x, b.y, '#c9a6ff', 5); }
-        else if (feet > b.y + 8 && px <= b.x + 4) {
+        else if (feet > b.y + 8 && px <= b.x + 4 && P.vx >= 0) { // ran into the LEFT wall
           if (feet < b.y + 34) { land(b); P.x = b.x + 10; } // ledge mantle: just pop up
-          else { P.x = b.x - R * 0.6; P.st = 'climb'; P.climbB = b; P.A = null; P.canDouble = true; P.flip = 0; }
-        } else if (feet > b.y + 8 && px >= b.x + b.w - 4 && P.vx < 0) { P.x = b.x + b.w + R * 0.6; P.vx = 60; }
+          else if (dirX > 0 || P.vx > 60) startClimb(b, -1);
+          else { P.x = b.x - R * 0.6; P.vx = 0; }
+        } else if (feet > b.y + 8 && px >= b.x + b.w - 4 && P.vx <= 0) { // ran into the RIGHT wall (going back)
+          if (feet < b.y + 34) { land(b); P.x = b.x + b.w - 10; }
+          else if (dirX < 0 || P.vx < -60) startClimb(b, 1);
+          else { P.x = b.x + b.w + R * 0.6; P.vx = 0; }
+        }
       }
     }
   }
   // fell to the street: no hearts lost, back up on a roof
   if (P.y + FEET > H - 14) {
     SFX.whoops(); pop('WHOOPS!', P.x, H - 120, '#55e6ff', true); score(-25); if (stats.score < 0) stats.score = 0;
-    const nb = B.find(b => b.x + b.w > P.x + 40) || P.lastB;
-    P.x = Math.max(nb.x + 20, Math.min(P.x + 20, nb.x + nb.w / 3)); P.y = nb.y - FEET - 120; P.vx = RUN; P.vy = 0; P.st = 'air'; P.A = null; P.inv = 1.2; P.canDouble = true; P.flip = 0;
+    let nb = P.lastB, nd = 1e9; for (const b of B) { const d = P.x < b.x ? b.x - P.x : P.x > b.x + b.w ? P.x - b.x - b.w : 0; if (d < nd) { nd = d; nb = b; } }
+    P.x = Math.max(nb.x + 24, Math.min(P.x, nb.x + nb.w - 24)); P.y = nb.y - FEET - 120; P.vx = 0; P.vy = 0; P.st = 'air'; P.A = null; P.inv = 1.2; P.canDouble = true; P.flip = 0;
   }
-  if (Math.abs(P.vx) > 30) P.face = P.vx > 0 ? 1 : -1;
+  if (!dirX && P.st === 'swing') P.face = P.sdir;
   const speed = Math.hypot(P.vx, P.vy);
   for (const t of TOK) if (!t.got && Math.abs(t.x - P.x) < 38 && Math.abs(t.y - P.y) < 48) { t.got = true; stats.tokens++; score(10); SFX.token(); burst(t.x, t.y, '#ff5c8f', 6); }
   for (const t of PAGES) if (!t.got && Math.abs(t.x - P.x) < 46 && Math.abs(t.y - P.y) < 58) { t.got = true; stats.pages++; score(100); SFX.page(); pop('COMIC PAGE ' + stats.pages + '/6!', t.x, t.y - 40, '#d9a6ff', true); burst(t.x, t.y, '#c38bff', 14); }
@@ -466,16 +503,17 @@ function step(dt) {
   FX = FX.filter(f => f.t < f.life);
   for (const t of TXT) t.t += dt; TXT = TXT.filter(t => t.t < 1.1);
   accStep(dt);
-  const target = P.x - CAM_X - Math.max(0, P.vx - RUN) * 0.08;
-  camX += (target - camX) * Math.min(1, dt * 4);
+  P.look = approach(P.look, P.face * LOOK, 170 * dt); // gentle look-ahead in the facing direction
+  const target = Math.max(0, P.x - W / 2 + P.look);
+  camX += (target - camX) * Math.min(1, dt * 4); if (camX < 0) camX = 0;
   if (P.x >= finishX) { score(stats.saved >= RESCUE_GOAL ? 500 : 0); endGame(true); }
 }
 
 function accStep(dt) {
   P.trailK = (P.trailK || 0) + 1; if (P.trailK % 3 === 0) { P.trail.push({ x: P.x, y: P.y }); if (P.trail.length > 16) P.trail.shift(); }
   const a = ward.acc;
-  if (a === 'headphones' && (P.st === 'swing' || P.flip) && Math.random() < dt * 12) FX.push({ note: Math.random() < 0.5 ? '♪' : '♫', x: P.x - 24, y: P.y - 34, vx: -50 - Math.random() * 40, vy: -40 - Math.random() * 50, t: 0, life: 1.2, col: Math.random() < 0.5 ? '#55e6ff' : '#ff4fa3' });
-  if (a === 'gauntlets' && Math.random() < dt * 12) FX.push({ spark: true, x: P.x + 30 + (Math.random() - 0.5) * 30, y: P.y - 10 + (Math.random() - 0.5) * 40, vx: (Math.random() - 0.5) * 160, vy: (Math.random() - 0.5) * 160, t: 0, life: 0.25, col: Math.random() < 0.5 ? '#7ff6ff' : '#ffd84a' });
+  if (a === 'headphones' && (P.st === 'swing' || P.flip) && Math.random() < dt * 12) FX.push({ note: Math.random() < 0.5 ? '♪' : '♫', x: P.x - 24 * P.face, y: P.y - 34, vx: (-50 - Math.random() * 40) * P.face, vy: -40 - Math.random() * 50, t: 0, life: 1.2, col: Math.random() < 0.5 ? '#55e6ff' : '#ff4fa3' });
+  if (a === 'gauntlets' && Math.random() < dt * 12) FX.push({ spark: true, x: P.x + (30 + (Math.random() - 0.5) * 30) * P.face, y: P.y - 10 + (Math.random() - 0.5) * 40, vx: (Math.random() - 0.5) * 160, vy: (Math.random() - 0.5) * 160, t: 0, life: 0.25, col: Math.random() < 0.5 ? '#7ff6ff' : '#ffd84a' });
 }
 function bolt(x1, y1, x2, y2, jit) { // jagged electric line
   const n = 9; ctx.beginPath(); ctx.moveTo(x1, y1);
@@ -646,40 +684,49 @@ function muzzle(x, y) {
 function drawPlayer() {
   if (P.inv > 0 && Math.floor(T * 12) % 2 === 0 && state === 'play') return;
   const classic = curKey() === 'up-none' || !ok(avImg(curKey(), 'run'));
+  const f = P.face < 0, fs = f ? -1 : 1; // facing left = horizontal mirror
   if (P.st === 'swing' && P.A) {
     const img = sprite('swing'), h = 112; if (!ok(img)) return;
     const w = img.naturalWidth * h / img.naturalHeight, hd = handOf('swing');
-    const hx = (hd[0] - 0.5) * w, hy = (hd[1] - 0.5) * h;
+    const hx = (hd[0] - 0.5) * w * fs, hy = (hd[1] - 0.5) * h;
     const a0 = Math.atan2(hy, hx), a1 = Math.atan2(P.A.y - P.y, P.A.x - P.x), rot = a1 - a0;
     const c = Math.cos(rot), s = Math.sin(rot), handX = P.x + hx * c - hy * s, handY = P.y + hx * s + hy * c;
     webLine(handX, handY, P.A.x, P.A.y);
-    drawImgH(img, P.x, P.y, h, false, rot);
+    drawImgH(img, P.x, P.y, h, f, rot);
   } else if (P.st === 'climb') {
-    drawImgH(sprite('swing'), P.x, P.y - 8, 106, false, 0);
+    drawImgH(sprite('swing'), P.x, P.y - 8, 106, f, 0);
   } else if (P.punch > 0) {
-    if (classic) drawImgH(IMG.river_zap, P.x + 4, P.y - 6, 92, false, 0);
-    else { drawImgH(sprite('run'), P.x, P.y - 6, 94, false, -0.05); muzzle(P.x + 38, P.y - 16); }
-    ctx.strokeStyle = ward.acc === 'gauntlets' ? '#7ff6ff' : '#ffde3b'; ctx.lineWidth = 3; for (let i = 0; i < 3; i++) { ctx.beginPath(); ctx.moveTo(P.x + 46, P.y - 30 + i * 9); ctx.lineTo(P.x + 62 + i * 4, P.y - 34 + i * 12); ctx.stroke(); }
+    if (classic) drawImgH(IMG.river_zap, P.x + 4 * fs, P.y - 6, 92, f, 0);
+    else { drawImgH(sprite('run'), P.x, P.y - 6, 94, f, -0.05 * fs); muzzle(P.x + 38 * fs, P.y - 16); }
+    ctx.strokeStyle = ward.acc === 'gauntlets' ? '#7ff6ff' : '#ffde3b'; ctx.lineWidth = 3; for (let i = 0; i < 3; i++) { ctx.beginPath(); ctx.moveTo(P.x + 46 * fs, P.y - 30 + i * 9); ctx.lineTo(P.x + (62 + i * 4) * fs, P.y - 34 + i * 12); ctx.stroke(); }
   } else if (P.flip) {
-    const k = Math.min(1, P.flipT / 0.45), rot = (1 - Math.pow(1 - k, 2)) * Math.PI * 2, img = sprite('jump');
-    ctx.globalAlpha = 0.25; drawImgH(img, P.x - P.vx * 0.04, P.y - P.vy * 0.04, 84, false, rot - 0.6); ctx.globalAlpha = 1;
-    drawImgH(img, P.x, P.y, 88 - Math.sin(k * Math.PI) * 10, false, rot);
+    const k = Math.min(1, P.flipT / 0.45), rot = (1 - Math.pow(1 - k, 2)) * Math.PI * 2 * fs, img = sprite('jump');
+    ctx.globalAlpha = 0.25; drawImgH(img, P.x - P.vx * 0.04, P.y - P.vy * 0.04, 84, f, rot - 0.6 * fs); ctx.globalAlpha = 1;
+    drawImgH(img, P.x, P.y, 88 - Math.sin(k * Math.PI) * 10, f, rot);
+  } else if (P.st === 'run' && Math.abs(P.vx) < 25) {
+    // ready stance: standing still with a subtle breathing bob
+    const br = Math.sin(T * 3.2), h = 96 + br * 1.6;
+    drawImgH(sprite('run'), P.x, P.y - 8 - (h - 96) / 2, h, f, 0);
   } else if (P.st === 'run') {
     const stride = Math.sin(T * 13);
-    drawImgH(sprite('run'), P.x, P.y - 8 - Math.abs(stride) * 4, 96, false, stride * 0.05);
+    drawImgH(sprite('run'), P.x, P.y - 8 - Math.abs(stride) * 4, 96, f, stride * 0.05);
   } else if (P.vy < -60 && P.jumping) {
-    drawImgH(sprite('jump'), P.x, P.y - 6, 94, false, 0.05);
+    drawImgH(sprite('jump'), P.x, P.y - 6, 94, f, 0.05 * fs);
   } else {
-    const rot = Math.max(-0.4, Math.min(0.45, Math.atan2(P.vy, Math.abs(P.vx) + 220) * 0.6));
-    if (classic) drawImgH(IMG.river_fly, P.x, P.y - 6, 94, false, rot);
-    else drawImgH(sprite('jump'), P.x, P.y - 6, 92, false, rot + 0.22); // jump pose tilted forward = flying
+    const rot = Math.max(-0.4, Math.min(0.45, Math.atan2(P.vy, Math.abs(P.vx) + 220) * 0.6)) * fs;
+    if (classic) drawImgH(IMG.river_fly, P.x, P.y - 6, 94, f, rot);
+    else drawImgH(sprite('jump'), P.x, P.y - 6, 92, f, rot + 0.22 * fs);
   }
-  if (ward.acc === 'gauntlets' && state === 'play' && Math.random() < 0.5) { ctx.fillStyle = Math.random() < .5 ? '#7ff6ff' : '#ffd84a'; ctx.beginPath(); ctx.arc(P.x + 30 + (Math.random() - .5) * 20, P.y - 4 + (Math.random() - .5) * 26, 2 + Math.random() * 2, 0, 7); ctx.fill(); }
+  if (ward.acc === 'gauntlets' && state === 'play' && Math.random() < 0.5) { ctx.fillStyle = Math.random() < .5 ? '#7ff6ff' : '#ffd84a'; ctx.beginPath(); ctx.arc(P.x + (30 + (Math.random() - .5) * 20) * fs, P.y - 4 + (Math.random() - .5) * 26, 2 + Math.random() * 2, 0, 7); ctx.fill(); }
 }
 // ---------- UI ----------
-const JUMPB = () => ({ x: 70, y: H - 82, r: 42 });
-const SWINGB = () => ({ x: W - 70, y: H - 82, r: 42 });
-const ZAPB = () => ({ x: W - 70, y: H - 206, r: 40 });
+// v4 controls: ◀ ▶ thumb pad bottom-left; JUMP / SWING / ZAP cluster bottom-right
+const PADL = () => ({ x: 12, y: H - 122, w: 74, h: 96 });
+const PADR = () => ({ x: 94, y: H - 122, w: 74, h: 96 });
+const JUMPB = () => ({ x: W - 64, y: H - 76, r: 44 });
+const SWINGB = () => ({ x: W - 160, y: H - 62, r: 36 });
+const ZAPB = () => ({ x: W - 84, y: H - 182, r: 36 });
+const padRole = p => p.x < 90 ? 'left' : 'right';
 const MUTE = () => ({ x: W - 30, y: 30, r: 22 });
 function btn(x, y, w, h, label, col) {
   ctx.save(); ctx.translate(x, y); ctx.rotate(-0.03);
@@ -708,25 +755,35 @@ function drawHUD() {
   drawMute();
   const nc = CIV.find(c => !c.saved && c.x > P.x - 50);
   // HELP arrow only while the person is fully off-screen, inset & lifted so it never sits on top of them
+  const bc = CIV.filter(c => !c.saved && c.x - camX < -34 && P.x - c.x < 900).pop();
+  if (bc) { const y = Math.max(150, Math.min(H - 320, bc.y - 120)); ctx.fillStyle = '#ffde3b'; ctx.strokeStyle = '#140818'; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(14, y); ctx.lineTo(34, y - 14); ctx.lineTo(34, y + 14); ctx.closePath(); ctx.stroke(); ctx.fill(); comicText('HELP', 60, y, 13, '#ffde3b'); }
   if (nc && nc.x - camX > W + 34 && nc.x - P.x < 1200) { const y = Math.max(150, Math.min(H - 320, nc.y - 120)); ctx.fillStyle = '#ffde3b'; ctx.strokeStyle = '#140818'; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(W - 14, y); ctx.lineTo(W - 34, y - 14); ctx.lineTo(W - 34, y + 14); ctx.closePath(); ctx.stroke(); ctx.fill(); comicText('HELP', W - 60, y, 13, '#ffde3b'); }
-  const roles = [...ptrs.values()];
-  // JUMP (left thumb)
+  const roles = [...ptrs.values()], md = moveDir();
+  // ◀ ▶ pad
+  for (const [b, d] of [[PADL(), -1], [PADR(), 1]]) {
+    const on = md === d;
+    ctx.fillStyle = 'rgba(0,0,0,.35)'; rrect(b.x + 3, b.y + 5, b.w, b.h, 18); ctx.fill();
+    const g = ctx.createLinearGradient(0, b.y, 0, b.y + b.h); g.addColorStop(0, on ? '#ffffff' : '#ffde3b'); g.addColorStop(1, on ? '#ffe98a' : '#ff9f1c');
+    ctx.fillStyle = g; rrect(b.x, b.y + (on ? 3 : 0), b.w, b.h, 18); ctx.fill(); ctx.lineWidth = 4; ctx.strokeStyle = '#140818'; ctx.stroke();
+    const cx = b.x + b.w / 2, cy = b.y + b.h / 2 + (on ? 3 : 0);
+    ctx.fillStyle = '#ff2e5f'; ctx.beginPath(); ctx.moveTo(cx + d * 20, cy); ctx.lineTo(cx - d * 14, cy - 22); ctx.lineTo(cx - d * 14, cy + 22); ctx.closePath(); ctx.fill(); ctx.lineWidth = 3; ctx.stroke();
+  }
+  // JUMP
   const j = JUMPB(); roundBtn(j, '#2f9bff', '#cfe9ff', roles.includes('jump') || input.jumpHeld);
   ctx.fillStyle = '#fff'; ctx.strokeStyle = '#140818'; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(j.x, j.y - 26); ctx.lineTo(j.x - 16, j.y - 6); ctx.lineTo(j.x - 6, j.y - 6); ctx.lineTo(j.x - 6, j.y + 6); ctx.lineTo(j.x + 6, j.y + 6); ctx.lineTo(j.x + 6, j.y - 6); ctx.lineTo(j.x + 16, j.y - 6); ctx.closePath(); ctx.stroke(); ctx.fill();
   comicText('JUMP', j.x, j.y + 22, 14, '#ffffff');
-  if (P.st !== 'run' && P.canDouble && P.st !== 'swing') { ctx.fillStyle = '#ffde3b'; ctx.beginPath(); ctx.arc(j.x + 30, j.y - 30, 7, 0, 7); ctx.fill(); ctx.strokeStyle = '#140818'; ctx.lineWidth = 2; ctx.stroke(); }
-  // SWING (right thumb)
-  const s = SWINGB(); roundBtn(s, swingHeld() ? '#ffffff' : '#c9b8ff', '#7a5cff', swingHeld());
-  ctx.strokeStyle = '#140818'; ctx.lineWidth = 2; for (let i = 0; i < 6; i++) { const a = i * Math.PI / 3; ctx.beginPath(); ctx.moveTo(s.x, s.y - 8); ctx.lineTo(s.x + Math.cos(a) * 18, s.y - 8 + Math.sin(a) * 18); ctx.stroke(); }
-  for (const rr of [8, 15]) { ctx.beginPath(); ctx.arc(s.x, s.y - 8, rr, 0, 7); ctx.stroke(); }
-  comicText('SWING', s.x, s.y + 22, 13, '#ffffff');
+  if (P.st !== 'run' && P.canDouble && P.st !== 'swing') { ctx.fillStyle = '#ffde3b'; ctx.beginPath(); ctx.arc(j.x - 32, j.y - 30, 7, 0, 7); ctx.fill(); ctx.strokeStyle = '#140818'; ctx.lineWidth = 2; ctx.stroke(); }
+  // SWING
+  const s = SWINGB(); roundBtn(s, swingHeld() ? '#ffffff' : '#b28cff', '#7a5cff', swingHeld());
+  ctx.strokeStyle = '#140818'; ctx.lineWidth = 2; for (let i = 0; i < 6; i++) { const a = i * Math.PI / 3; ctx.beginPath(); ctx.moveTo(s.x, s.y - 7); ctx.lineTo(s.x + Math.cos(a) * 15, s.y - 7 + Math.sin(a) * 15); ctx.stroke(); }
+  for (const rr of [6, 12]) { ctx.beginPath(); ctx.arc(s.x, s.y - 7, rr, 0, 7); ctx.stroke(); }
+  comicText('SWING', s.x, s.y + 19, 11, '#ffffff');
   // ZAP
   const z = ZAPB(); roundBtn(z, P.zapCD > 0 ? '#8a1a3a' : '#ff2e5f', '#ffd1e0', roles.includes('zap'));
-  spiderGlyph(ctx, z.x, z.y - 8, 32, '#140818'); comicText('ZAP', z.x, z.y + 22, 14, '#ffffff');
+  spiderGlyph(ctx, z.x, z.y - 7, 26, '#140818'); comicText('ZAP', z.x, z.y + 19, 12, '#ffffff');
   if (hintT > 0) {
-    ctx.globalAlpha = Math.min(1, hintT); const y = H * 0.4 + Math.sin(T * 5) * 6;
-    comicText('Tap JUMP to jump!', W / 2, y, 24, '#ffffff'); comicText('Tap again in the air = DOUBLE-JUMP!', W / 2, y + 32, 15, '#ffde3b');
-    comicText('HOLD the screen or SWING to web-swing', W / 2, y + 58, 14, '#7be0ff'); ctx.globalAlpha = 1;
+    ctx.globalAlpha = Math.min(1, hintT * 2); const y = 150 + Math.sin(T * 4) * 3;
+    comicText('◀ ▶ to run  ·  JUMP  ·  hold to SWING', W / 2, y, 16, '#ffffff'); ctx.globalAlpha = 1;
   }
 }
 function avatarBadge(x, y, r) {
@@ -764,9 +821,9 @@ function drawTitle() {
   btn(cx, L.play.y + 31, 200, 62, 'PLAY!', '#ff2e5f');
   suitBtn(cx, L.suit.y + 27, 200, 54);
   ctx.font = 'bold 13px "Helvetica Neue", Arial, sans-serif'; ctx.textAlign = 'center'; ctx.fillStyle = '#f3e6ff';
-  const lines = ['⬆ JUMP: tap to jump, hold to go higher, tap again to FLIP!', 'HOLD the screen (or SWING) to web-swing, let go to fly.', 'ZAP bad guys, save ' + RESCUE_GOAL + ' people, grab 6 comic pages!', 'Spend tokens & pages on new gear in SUIT UP!'];
-  const ly = L.suit.y + 80; lines.forEach((l, i) => ctx.fillText(l, cx, ly + i * 19));
-  if (best > 0) comicText('BEST: ' + best, cx, Math.min(H - 16, ly + 4 * 19 + 14), 17, '#7be0ff');
+  const lines = ['◀ ▶ run left or right, stop or turn back anytime!', 'JUMP: hold = higher, tap again in the air = FLIP!', 'HOLD up top (or SWING) to web-swing either way.', 'ZAP bad guys, save ' + RESCUE_GOAL + ' people, grab 6 comic pages!', 'Spend tokens & pages on new gear in SUIT UP!'];
+  const ly = L.suit.y + 78; lines.forEach((l, i) => ctx.fillText(l, cx, ly + i * 18));
+  comicText(best > 0 ? 'BEST: ' + best : 'BEST: 0  ·  BRAND-NEW GAME!', cx, Math.min(H - 14, ly + 5 * 18 + 12), 16, '#7be0ff');
   ctx.save(); ctx.translate(36, 34); ctx.rotate(-0.12); ctx.fillStyle = '#ffde3b'; ctx.fillRect(-24, -13, 48, 26); ctx.lineWidth = 3; ctx.strokeStyle = '#140818'; ctx.strokeRect(-24, -13, 48, 26); ctx.restore();
   comicText('v' + VERSION, 36, 34, 16, '#ff2e5f', -0.12);
   drawMute();
@@ -808,15 +865,16 @@ function drawEnd() {
 // ---------- SUIT UP! screen ----------
 function suitLayout() {
   const cardW = 116, cardH = Math.min(150, Math.max(118, (H - 520) / 2)), gap = 8, x0 = (W - (3 * cardW + 2 * gap)) / 2;
-  const gridTop = H - 2 * cardH - gap - 14;
+  const gridTop = H - 2 * cardH - gap - 40;
   const cards = ACCS.map((a, i) => ({ a, x: x0 + (i % 3) * (cardW + gap), y: gridTop + Math.floor(i / 3) * (cardH + gap), w: cardW, h: cardH }));
   const maskY = gridTop - 62, masks = MASKS.map((m, i) => ({ m, x: x0 + i * (cardW + gap), y: maskY, w: cardW, h: 50 }));
   const act = { x: W / 2 - 115, y: maskY - 60, w: 230, h: 48 };
   const pr = Math.max(54, Math.min(100, (act.y - 40 - 64) / 2 / 1.3 - 4));
-  return { cards, masks, act, back: { x: 8, y: 10, w: 98, h: 42 }, pc: { x: W / 2, y: 64 + pr * 1.3, r: pr }, nameY: act.y - 22 };
+  const mw = W - 40, mh = 250, my = H / 2 - mh / 2;
+  return { reset: { x: W / 2 - 66, y: H - 32, w: 132, h: 26 }, modal: { x: 20, y: my, w: mw, h: mh }, cancel: { x: 34, y: my + mh - 82, w: (mw - 42) / 2, h: 62 }, yes: { x: 34 + (mw - 42) / 2 + 14, y: my + mh - 82, w: (mw - 42) / 2, h: 62 }, cards, masks, act, back: { x: 8, y: 10, w: 98, h: 42 }, pc: { x: W / 2, y: 64 + pr * 1.3, r: pr }, nameY: act.y - 22 };
 }
 function openSuit() {
-  state = 'suit'; suitAcc = ward.acc; FX = []; TXT = []; ptrs.clear(); keySwing = false;
+  state = 'suit'; suitModal = false; suitAcc = ward.acc; FX = []; TXT = []; ptrs.clear(); keySwing = false;
   for (const a of ACCS) avImg(comboKey(ward.mask, a.id), 'p');
   for (const m of MASKS) avImg(comboKey(m.id, ward.acc), 'p');
 }
@@ -886,6 +944,21 @@ function drawSuit() {
   }
   // confetti + pops (screen space)
   for (const f of FX) { if (f.conf) { ctx.save(); ctx.translate(f.x, f.y); ctx.rotate(f.rot); ctx.fillStyle = f.col; ctx.fillRect(-5, -3, 10, 6); ctx.restore(); } }
+  // discreet reset (two taps: button + confirm)
+  { const r = L.reset; ctx.globalAlpha = 0.55; ctx.strokeStyle = '#a99bb8'; ctx.lineWidth = 1; rrect(r.x, r.y, r.w, r.h, 13); ctx.stroke();
+    ctx.font = 'bold 11px "Helvetica Neue", Arial, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillStyle = '#c9b8d8'; ctx.fillText('↺ Reset Progress', r.x + r.w / 2, r.y + r.h / 2 + 1); ctx.globalAlpha = 1; }
+  if (suitModal) {
+    ctx.fillStyle = 'rgba(5,0,12,.78)'; ctx.fillRect(0, 0, W, H);
+    const m = L.modal; ctx.fillStyle = '#140818'; rrect(m.x + 5, m.y + 7, m.w, m.h, 18); ctx.fill();
+    ctx.fillStyle = '#2a1040'; rrect(m.x, m.y, m.w, m.h, 18); ctx.fill(); ctx.lineWidth = 4; ctx.strokeStyle = '#ffde3b'; ctx.stroke();
+    comicText('Start a brand-new game?', W / 2, m.y + 40, 21, '#ffde3b', -0.02);
+    ctx.font = 'bold 15px "Helvetica Neue", Arial, sans-serif'; ctx.textAlign = 'center'; ctx.fillStyle = '#f3e6ff';
+    ctx.fillText('Resets High Score, Tokens,', W / 2, m.y + 84); ctx.fillText('Comic Pages & Gear to 0.', W / 2, m.y + 106);
+    for (const [b, lab, col] of [[L.cancel, 'CANCEL', '#5a4a72'], [L.yes, 'YES, RESET', '#e0123f']]) {
+      ctx.fillStyle = '#140818'; rrect(b.x + 3, b.y + 5, b.w, b.h, 14); ctx.fill(); ctx.fillStyle = col; rrect(b.x, b.y, b.w, b.h, 14); ctx.fill(); ctx.lineWidth = 3; ctx.strokeStyle = '#140818'; ctx.stroke();
+      comicText(lab, b.x + b.w / 2, b.y + b.h / 2 + 1, lab.length > 7 ? 17 : 20, '#ffffff');
+    }
+  }
   for (const t of TXT) { const k = t.t / 1.4; ctx.globalAlpha = 1 - Math.max(0, k - 0.6) / 0.4; comicText(t.s, t.x, t.y - k * 30, t.big ? 44 * Math.min(1, t.t * 6) : 22, t.col, -0.08); ctx.globalAlpha = 1; }
 }
 function unlockAcc(a) {
@@ -897,9 +970,17 @@ function unlockAcc(a) {
   TXT.push({ s: 'UNLOCKED!', x: W / 2, y: L.pc.y + L.pc.r * 0.2, t: 0, col: '#ffde3b', big: true });
   return true;
 }
+function resetProgress() {
+  best = 0; newBest = false; bankMsg = null; try { localStorage.removeItem(HS_KEY); } catch (e) { }
+  ward = freshWard(); saveWard(); suitAcc = 'none'; suitModal = false; preloadCombo(curKey());
+  SFX.rescue(); const L = suitLayout();
+  TXT.push({ s: 'FRESH START!', x: W / 2, y: L.pc.y + L.pc.r * 0.2, t: 0, col: '#7dff8a', big: true });
+}
 const inR = (p, r) => p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h;
 function suitTap(p) {
   const L = suitLayout();
+  if (suitModal) { if (inR(p, L.yes)) resetProgress(); else if (inR(p, L.cancel)) { suitModal = false; SFX.click(); } return; }
+  if (inR(p, { x: L.reset.x - 6, y: L.reset.y - 6, w: L.reset.w + 12, h: L.reset.h + 12 })) { suitModal = true; SFX.click(); return; }
   if (inR(p, L.back)) { SFX.click(); closeSuit(); return; }
   for (const m of L.masks) if (inR(p, m)) { ward.mask = m.m.id; saveWard(); SFX.click(); preloadCombo(comboKey(ward.mask, suitAcc)); for (const a of ACCS) avImg(comboKey(ward.mask, a.id), 'p'); return; }
   for (const c of L.cards) if (inR(p, c)) { suitAcc = c.a.id; preloadCombo(comboKey(ward.mask, suitAcc)); if (ward.unlocked.includes(suitAcc)) { ward.acc = suitAcc; saveWard(); SFX.page(); } else SFX.click(); return; }
@@ -920,9 +1001,12 @@ function toLocal(cx, cy) { return { x: (cx - OX) / S, y: cy / S }; }
 const near = (p, b, pad) => Math.hypot(p.x - b.x, p.y - b.y) < b.r + (pad || 0);
 function roleFor(p) {
   if (near(p, MUTE(), 8)) return 'mute';
-  if (near(p, ZAPB(), 16)) return 'zap';
-  if (near(p, JUMPB(), 22) || (p.y > H - 150 && p.x < W * 0.42)) return 'jump'; // whole bottom-left thumb zone = JUMP
-  return 'swing'; // SWING button or anywhere else in the play area
+  if (near(p, ZAPB(), 12)) return 'zap';
+  if (near(p, JUMPB(), 8)) return 'jump';
+  if (near(p, SWINGB(), 6)) return 'swing';
+  if (p.y > H - 200 && p.x < 186) return padRole(p); // ◀ ▶ thumb pad (generous zone)
+  if (p.y < H - 200) return 'swing'; // hold anywhere in the upper play area = swing
+  return 'none';
 }
 function down(e) {
   e.preventDefault(); ac();
@@ -940,6 +1024,10 @@ function down(e) {
 function up(e) { ptrs.delete(e.pointerId); if (!swingHeld()) input.block = false; }
 cv.addEventListener('pointerdown', down);
 cv.addEventListener('pointerup', up);
+cv.addEventListener('pointermove', e => { // slide a thumb between ◀ and ▶ without lifting
+  const r = ptrs.get(e.pointerId); if (r !== 'left' && r !== 'right') return;
+  ptrs.set(e.pointerId, padRole(toLocal(e.clientX, e.clientY)));
+});
 cv.addEventListener('pointercancel', up);
 cv.addEventListener('lostpointercapture', up);
 cv.addEventListener('touchstart', e => e.preventDefault(), { passive: false });
@@ -948,14 +1036,16 @@ const JUMP_KEYS = ['Space', 'ArrowUp', 'KeyW'], SWING_KEYS = ['ShiftLeft', 'Shif
 addEventListener('keydown', e => {
   if (e.repeat) return; ac();
   const k = e.code;
-  if (state === 'suit') { if (k === 'Escape' || k === 'Backspace') closeSuit(); return; }
+  if (state === 'suit') { if (k === 'Escape' || k === 'Backspace') { if (suitModal) suitModal = false; else closeSuit(); } return; }
   if (state !== 'play') { if (k === 'KeyS') { openSuit(); return; } if (JUMP_KEYS.includes(k) || k === 'Enter') { if (state === 'title' || endT > 1) newGame(); e.preventDefault(); } return; }
+  if (k === 'ArrowLeft' || k === 'KeyA') { keyL = true; e.preventDefault(); }
+  if (k === 'ArrowRight' || k === 'KeyD') { keyR = true; e.preventDefault(); }
   if (JUMP_KEYS.includes(k)) { input.jumpQ = JUMP_BUFFER; input.jumpHeld = true; e.preventDefault(); }
   if (SWING_KEYS.includes(k)) { keySwing = true; input.block = false; }
   if (ZAP_KEYS.includes(k)) input.zapQ = true;
 });
-addEventListener('keyup', e => { if (JUMP_KEYS.includes(e.code)) input.jumpHeld = false; if (SWING_KEYS.includes(e.code)) keySwing = false; });
-document.addEventListener('visibilitychange', () => { if (document.hidden) { ptrs.clear(); keySwing = false; input.jumpHeld = false; } });
+addEventListener('keyup', e => { if (e.code === 'ArrowLeft' || e.code === 'KeyA') keyL = false; if (e.code === 'ArrowRight' || e.code === 'KeyD') keyR = false; if (JUMP_KEYS.includes(e.code)) input.jumpHeld = false; if (SWING_KEYS.includes(e.code)) keySwing = false; });
+document.addEventListener('visibilitychange', () => { if (document.hidden) { ptrs.clear(); keySwing = false; keyL = keyR = false; input.jumpHeld = false; } });
 
 // ---------- loop ----------
 let last = performance.now(), acc = 0;
@@ -966,4 +1056,4 @@ function frame(now) {
   render(); requestAnimationFrame(frame);
 }
 resize(); requestAnimationFrame(frame);
-window.__game = { get P() { return P; }, get stats() { return stats; }, get state() { return state; }, get EN() { return EN; }, get CIV() { return CIV; }, get TOK() { return TOK; }, get PAGES() { return PAGES; }, get ANCH() { return ANCH; }, get B() { return B; }, get camX() { return camX; }, get ptrs() { return [...ptrs.entries()]; }, roofAt: x => roofAt(x), get H() { return H; }, get W() { return W; }, newGame, endGame, HERO_NAME, VERSION, get ward() { return ward; }, get suitAcc() { return suitAcc; }, openSuit, closeSuit, suitLayout, titleLayout, endLayout, unlockAcc, curKey, AVC, ACCS, get best() { return best; }, setWard(w) { ward = Object.assign(ward, w); saveWard(); }, consts: { RUN, GRAV, MAXV, JUMP_V, DJUMP_V, CAM_X } };
+window.__game = { get P() { return P; }, get stats() { return stats; }, get state() { return state; }, get EN() { return EN; }, get CIV() { return CIV; }, get TOK() { return TOK; }, get PAGES() { return PAGES; }, get ANCH() { return ANCH; }, get B() { return B; }, get camX() { return camX; }, get ptrs() { return [...ptrs.entries()]; }, roofAt: x => roofAt(x), get H() { return H; }, get W() { return W; }, newGame, endGame, HERO_NAME, VERSION, get ward() { return ward; }, get suitAcc() { return suitAcc; }, openSuit, closeSuit, suitLayout, titleLayout, endLayout, unlockAcc, curKey, AVC, ACCS, get best() { return best; }, moveDir, pickAnchor: d => pickAnchor(d), get suitModal() { return suitModal; }, resetProgress, PADL, PADR, JUMPB, SWINGB, ZAPB, setWard(w) { ward = Object.assign(ward, w); saveWard(); }, consts: { RUN_R, RUN_L, GRAV, MAXV, JUMP_V, DJUMP_V, CAM_X } };
